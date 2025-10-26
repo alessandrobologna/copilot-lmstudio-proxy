@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "copilot-lmstudio-proxy")]
@@ -43,6 +44,13 @@ async fn main() {
     let config = Config::parse();
     CONFIG.set(config.clone()).expect("Failed to set config");
 
+    // Initialize HTTP client (reused for all requests for connection pooling)
+    let client = reqwest::Client::builder()
+        .http1_only() // LMStudio might not support HTTP/2
+        .build()
+        .expect("Failed to create HTTP client");
+    HTTP_CLIENT.set(client).expect("Failed to set HTTP client");
+
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
@@ -58,17 +66,12 @@ async fn main() {
         format!("127.0.0.1:{}", config.port)
     };
 
-    info!("Starting Copilot-LMStudio Proxy");
-    info!("Listening on: http://{}", bind_addr);
-    info!("Proxying to: {}", config.lmstudio_url);
+    info!("Copilot-LMStudio Proxy starting");
+    info!("  Listening: http://{}", bind_addr);
+    info!("  Upstream: {}", config.lmstudio_url);
     if config.cors {
-        info!("CORS: Enabled");
+        info!("  CORS: enabled");
     }
-    info!("");
-    info!("Fixes:");
-    info!("  1. Adds type: 'object' to tool parameters");
-    info!("  2. Adds input_tokens_details to usage responses");
-    info!("");
 
     let mut app = Router::new().fallback(any(proxy_handler));
 
@@ -115,6 +118,8 @@ async fn proxy_handler(req: Request) -> Result<Response, StatusCode> {
         }
     };
 
+    let config = CONFIG.get().expect("Config not initialized");
+
     // Try to parse and fix the body if it's JSON
     let fixed_body_bytes = if !body_bytes.is_empty() && is_json_request(&parts.headers) {
         match fix_request_body(&body_bytes) {
@@ -129,7 +134,6 @@ async fn proxy_handler(req: Request) -> Result<Response, StatusCode> {
     };
 
     // Build the upstream URL
-    let config = CONFIG.get().expect("Config not initialized");
     let lmstudio_base = config.lmstudio_url.trim_end_matches('/');
     let upstream_url = format!("{}{}", lmstudio_base, path);
     let upstream_url_with_query = if query.is_empty() {
@@ -138,15 +142,25 @@ async fn proxy_handler(req: Request) -> Result<Response, StatusCode> {
         format!("{}?{}", upstream_url, query)
     };
 
-    // Create upstream request
-    let client = reqwest::Client::new();
+    // Create upstream request using the shared client
+    let client = HTTP_CLIENT.get().expect("HTTP client not initialized");
     let mut upstream_req = client.request(method.clone(), &upstream_url_with_query);
 
-    // Copy headers (except Host)
+    // Copy headers (except Host and problematic headers)
     for (name, value) in parts.headers.iter() {
-        if name != "host" {
-            upstream_req = upstream_req.header(name, value);
+        let name_str = name.as_str();
+        // Skip host and headers that might cause issues. Reqwest recalculates
+        // connection management, compression, and body length on our behalf.
+        if name_str == "host"
+            || name_str.starts_with("sec-")
+            || name_str == "connection"
+            || name_str == "accept-encoding"
+            || name_str == "content-length"
+        {
+            continue;
         }
+
+        upstream_req = upstream_req.header(name, value);
     }
 
     // Add body
@@ -162,9 +176,11 @@ async fn proxy_handler(req: Request) -> Result<Response, StatusCode> {
     };
 
     let status = upstream_response.status();
-    let headers = upstream_response.headers().clone();
+    let mut headers = upstream_response.headers().clone();
 
-    info!("Response: {}", status);
+    if !status.is_success() {
+        warn!("Response: {}", status);
+    }
 
     // Check if this is a streaming response
     let is_streaming = headers
@@ -172,6 +188,9 @@ async fn proxy_handler(req: Request) -> Result<Response, StatusCode> {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.contains("text/event-stream"))
         .unwrap_or(false);
+
+    // Strip hop-by-hop and encoding headers after reqwest's automatic decompression
+    sanitize_response_headers(&mut headers);
 
     if is_streaming {
         // Handle streaming response
@@ -240,9 +259,16 @@ fn fix_request_body(body: &Bytes) -> Result<Bytes, Box<dyn std::error::Error>> {
     if let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) {
         let mut fixed_count = 0;
         for tool in tools.iter_mut() {
-            if let Some(function) = tool.get_mut("function")
-                && let Some(parameters) = function.get_mut("parameters")
-            {
+            // Handle both formats:
+            // 1. OpenAI function calling: tool.function.parameters
+            // 2. Direct format: tool.parameters
+            let parameters_ref = if let Some(function) = tool.get_mut("function") {
+                function.get_mut("parameters")
+            } else {
+                tool.get_mut("parameters")
+            };
+
+            if let Some(parameters) = parameters_ref {
                 // If parameters is an object without a type field, or an empty object
                 if parameters.is_object() {
                     let params_obj = parameters.as_object_mut().unwrap();
@@ -345,5 +371,111 @@ fn fix_streaming_chunk(chunk: &Bytes) -> Result<Bytes, Box<dyn std::error::Error
         Ok(Bytes::from(fixed_chunk))
     } else {
         Ok(chunk.clone())
+    }
+}
+
+fn sanitize_response_headers(headers: &mut HeaderMap) {
+    // These headers no longer reflect reality after reqwest decompressed the payload.
+    headers.remove("content-encoding");
+    headers.remove("transfer-encoding");
+    headers.remove("content-length");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use bytes::Bytes;
+
+    #[test]
+    fn fixes_missing_tool_parameter_schema() {
+        let input = json!({
+            "tools": [
+                { "function": { "parameters": {} } },
+                { "parameters": {} },
+                {
+                    "function": {
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "foo": { "type": "string" } }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let bytes = Bytes::from(serde_json::to_vec(&input).unwrap());
+        let fixed = fix_request_body(&bytes).expect("request body fix should succeed");
+        let fixed_json: Value = serde_json::from_slice(&fixed).unwrap();
+        let tools = fixed_json["tools"]
+            .as_array()
+            .expect("tools should remain an array");
+
+        let first_params = tools[0]["function"]["parameters"].as_object().unwrap();
+        assert_eq!(first_params["type"], "object");
+        assert!(first_params["properties"].as_object().unwrap().is_empty());
+
+        let second_params = tools[1]["parameters"].as_object().unwrap();
+        assert_eq!(second_params["type"], "object");
+        assert!(second_params["properties"].as_object().unwrap().is_empty());
+
+        let third_params = tools[2]["function"]["parameters"].as_object().unwrap();
+        assert_eq!(third_params["type"], "object");
+        assert_eq!(
+            third_params["properties"].as_object().unwrap()["foo"],
+            json!({ "type": "string" })
+        );
+    }
+
+    #[test]
+    fn adds_missing_usage_details() {
+        let input = json!({
+            "usage": {}
+        });
+
+        let bytes = Bytes::from(serde_json::to_vec(&input).unwrap());
+        let fixed = fix_response_body(&bytes).expect("response body fix should succeed");
+        let fixed_json: Value = serde_json::from_slice(&fixed).unwrap();
+        let usage = fixed_json["usage"].as_object().unwrap();
+
+        assert_eq!(usage["input_tokens_details"], json!({ "cached_tokens": 0 }));
+        assert_eq!(
+            usage["output_tokens_details"],
+            json!({ "reasoning_tokens": 0 })
+        );
+    }
+
+    #[test]
+    fn fixes_streaming_usage_chunks() {
+        let chunk = Bytes::from("data: {\"response\":{\"usage\":{}}}\n\n");
+        let fixed = fix_streaming_chunk(&chunk).expect("stream chunk fix should succeed");
+        assert_ne!(fixed, chunk);
+
+        let fixed_str = std::str::from_utf8(&fixed).unwrap();
+        assert!(fixed_str.contains("input_tokens_details"));
+        assert!(fixed_str.contains("output_tokens_details"));
+    }
+
+    #[test]
+    fn leaves_done_streaming_marker_untouched() {
+        let chunk = Bytes::from("data: [DONE]\n\n");
+        let fixed = fix_streaming_chunk(&chunk).expect("[DONE] chunk fix should succeed");
+        assert_eq!(fixed, chunk);
+    }
+
+    #[test]
+    fn sanitizes_decompressed_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("content-length", HeaderValue::from_static("42"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        sanitize_response_headers(&mut headers);
+
+        assert!(headers.get("content-encoding").is_none());
+        assert!(headers.get("transfer-encoding").is_none());
+        assert!(headers.get("content-length").is_none());
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
     }
 }

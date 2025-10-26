@@ -11,8 +11,7 @@ A lightweight HTTP proxy that fixes compatibility issues between GitHub Copilot 
 
 ### Issue #2: Tool Parameters Missing `type: "object"`
 - **Problem:** Copilot sends tools with `parameters: {}` instead of `parameters: { type: "object", properties: {} }`
-- **Fix:** Automatically adds `type: "object"` to all tool parameters
-- **Affected Tools:** `terminal_last_command`, `terminal_selection`, and any tool with `inputSchema: undefined`
+- **Fix:** Automatically adds `type: "object"` and `properties: {}` to any tool parameter schema that's missing these required fields (supports both OpenAI function calling and direct parameter formats)
 
 ## Quick Start
 
@@ -138,7 +137,7 @@ Copilot's tool schema normalizer (`toolSchemaNormalizer.ts:58-65`) exits early w
 Invalid discriminator value. Expected 'object' at tools.X.parameters.type
 ```
 
-Affected tools include `terminal_last_command` and `terminal_selection`, which have `inputSchema: undefined` in Copilot's codebase.
+This affects any tool sent by Copilot with empty or incomplete parameter schemas. The issue occurs in both OpenAI function calling format (`tool.function.parameters`) and direct parameter format (`tool.parameters`).
 
 ### The Solution
 
